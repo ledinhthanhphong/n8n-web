@@ -1,15 +1,16 @@
 # --- Stage 1: Build ---
 FROM node:24-alpine AS build-stage
 WORKDIR /app
-COPY package.json yarn.lock ./
-RUN corepack enable && yarn install
+RUN corepack enable
+COPY package.json yarn.lock .yarnrc.yml ./
+RUN yarn install --immutable
 COPY . .
 RUN yarn build
 
 # --- Stage 2: Serve ---
 FROM nginx:stable-alpine
 
-RUN rm -rf /usr/share/nginx/html/*
+RUN apk upgrade --no-cache && rm -rf /usr/share/nginx/html/*
 
 COPY --from=build-stage /app/dist /usr/share/nginx/html
 

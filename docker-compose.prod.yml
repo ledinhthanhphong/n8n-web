@@ -5,17 +5,17 @@ services:
     restart: always
     environment:
       - NODE_ENV=production
-      - MONGO_URI=${MONGO_URI}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+    # MONGO_URI, JWT_SECRET_KEY, ... được nạp từ file này
     env_file:
       - .env.production
     networks:
       - n8n-network
+    # Chỉ mở cho localhost (debug trên server). Bên ngoài phải đi qua Nginx (frontend)
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5000/api/v1/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1))"]
-      interval: 30s
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:5000/api/v1/health', (res) => { process.exit(res.statusCode === 200 ? 0 : 1); }).on('error', () => process.exit(1))"]
+      interval: 15s
       timeout: 10s
       retries: 3
       start_period: 60s
@@ -28,9 +28,15 @@ services:
       - "80:80"
     depends_on:
       backend:
-        condition: service_started
+        condition: service_healthy
     networks:
       - n8n-network
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 networks:
   n8n-network:

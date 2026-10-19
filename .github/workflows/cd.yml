@@ -3,40 +3,58 @@ name: 🚀 CD (Deploy to Production)
 on:
   push:
     branches: ["main"]
+  workflow_dispatch:
 
+permissions:
+  contents: read
+
+# Chỉ 1 deploy production tại 1 thời điểm, không huỷ deploy đang chạy
 concurrency:
-  group: production-${{ github.workflow }}-${{ github.ref }}
+  group: production-deploy
   cancel-in-progress: false
 
 env:
-  REGISTRY: docker.io
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TRIVY_VERSION: 0.75.0
   IMAGE_TAG: ${{ github.sha }}
+  # Username Docker Hub không phải bí mật -> ưu tiên Variables (log dễ đọc), fallback về Secrets
+  DOCKER_NAMESPACE: ${{ vars.DOCKER_USERNAME || secrets.DOCKER_USERNAME }}
 
 jobs:
   # =========================
-  # 1️⃣ BUILD & PUSH DOCKER
+  # 0️⃣ CI (lint / syntax check)
   # =========================
-  docker-build:
-    name: Build & Push
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  # =========================
+  # 1️⃣ BUILD → SCAN → PUSH
+  # =========================
+  # Image chỉ được push lên registry SAU KHI qua Trivy scan
+  build-scan-push:
+    name: Build, Scan & Push (${{ matrix.name }})
     runs-on: ubuntu-24.04
+    needs: ci
+    timeout-minutes: 25
     strategy:
+      fail-fast: true
       matrix:
         include:
           - name: backend
             context: ./n8n-server
-            image: backend
           - name: frontend
             context: ./n8n-client
-            image: frontend
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Create Production Env for Frontend
         if: matrix.name == 'frontend'
-        run: |
-          echo "VITE_API_URL=${{ secrets.VITE_API_URL }}" > ./n8n-client/.env.production
-          echo "✅ Created .env.production for frontend build"
+        env:
+          VITE_API_URL: ${{ vars.VITE_API_URL || secrets.VITE_API_URL }}
+        run: echo "VITE_API_URL=${VITE_API_URL}" > ./n8n-client/.env.production
 
       - uses: docker/setup-buildx-action@v3
 
@@ -45,38 +63,20 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - uses: docker/build-push-action@v6
+      - name: Build image (load locally, not pushed yet)
+        uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
-          push: true
-          tags: |
-            ${{ secrets.DOCKER_USERNAME }}/${{ matrix.image }}:latest
-            ${{ secrets.DOCKER_USERNAME }}/${{ matrix.image }}:${{ env.IMAGE_TAG }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # =========================
-  # 2️⃣ SECURITY SCAN
-  # =========================
-  image-scan:
-    name: Trivy Scan
-    runs-on: ubuntu-24.04
-    needs: docker-build
-    strategy:
-      matrix:
-        image_name: [backend, frontend]
-
-    steps:
-      - uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          push: false
+          load: true
+          tags: ${{ env.DOCKER_NAMESPACE }}/${{ matrix.name }}:${{ env.IMAGE_TAG }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
 
       - id: date
         run: echo "today=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
 
-      # Cache Trivy vulnerability DB để tránh tải lại mỗi lần chạy
-      # (tránh bị GitHub Container Registry rate-limit khi chạy nhiều lần/ngày về lâu dài)
+      # Cache Trivy vulnerability DB để tránh tải lại mỗi lần chạy (tránh bị rate-limit)
       - name: Cache Trivy DB
         uses: actions/cache@v4
         with:
@@ -84,27 +84,35 @@ jobs:
           key: trivy-db-${{ steps.date.outputs.today }}
           restore-keys: trivy-db-
 
-      - name: Scan image
+      - name: Trivy scan
         run: |
           mkdir -p ~/.cache/trivy
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v "$HOME/.docker:/root/.docker:ro" \
             -v "$HOME/.cache/trivy:/root/.cache/trivy" \
-            aquasec/trivy:0.53.0 image \
+            "aquasec/trivy:${TRIVY_VERSION}" image \
             --severity CRITICAL,HIGH \
             --ignore-unfixed \
             --exit-code 1 \
-            ${{ secrets.DOCKER_USERNAME }}/${{ matrix.image_name }}:${{ env.IMAGE_TAG }}
+            "${DOCKER_NAMESPACE}/${{ matrix.name }}:${IMAGE_TAG}"
+
+      - name: Push image (SHA + latest)
+        run: |
+          IMAGE="${DOCKER_NAMESPACE}/${{ matrix.name }}"
+          docker tag "${IMAGE}:${IMAGE_TAG}" "${IMAGE}:latest"
+          docker push "${IMAGE}:${IMAGE_TAG}"
+          docker push "${IMAGE}:latest"
 
   # =========================
-  # 3️⃣ DEPLOY (WITH ROLLBACK)
+  # 2️⃣ DEPLOY (WITH ROLLBACK)
   # =========================
   deploy:
     name: Deploy with rollback
     runs-on: self-hosted
-    needs: image-scan
-    timeout-minutes: 8
+    needs: build-scan-push
+    timeout-minutes: 15
+    # Bật "Required reviewers" trong Settings → Environments → production nếu muốn duyệt tay trước khi deploy
+    environment: production
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -116,99 +124,121 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Deploy with rollback
+        shell: bash
+        env:
+          APP_DIR: /home/ubuntu/app
         run: |
-          set -e
-          mkdir -p /home/ubuntu/app
-          cp docker-compose.prod.yml /home/ubuntu/app/
-          cd /home/ubuntu/app
+          set -Eeo pipefail
 
-          setup_env() {
-            if [ -f .env.production ]; then
-              export $(grep -v '^#' .env.production | xargs)
-              export JWT_SECRET=${JWT_SECRET_KEY:-$JWT_SECRET}
-            fi
-            export IMAGE_BACKEND="${{ secrets.DOCKER_USERNAME }}/backend"
-            export IMAGE_FRONTEND="${{ secrets.DOCKER_USERNAME }}/frontend"
-            export IMAGE_TAG="${{ env.IMAGE_TAG }}"
+          compose() { docker compose -f docker-compose.prod.yml --env-file .env.production "$@"; }
+
+          # Gọi URL có retry (app có thể cần vài giây sau khi container healthy)
+          check_url() {
+            for _ in $(seq 1 10); do
+              curl -fsS -o /dev/null --max-time 5 "$1" && return 0
+              sleep 3
+            done
+            return 1
           }
 
-          setup_env
+          health_check() {
+            echo "Checking API via Nginx..."
+            check_url http://localhost/api/v1/health || { echo "API health check via Nginx FAILED"; return 1; }
+            echo "Checking Frontend UI..."
+            check_url http://localhost/ || { echo "Frontend UI check FAILED"; return 1; }
+          }
 
-          echo "Backup current version"
-          # Backup theo image ID của container ĐANG chạy thật sự, không dựa vào tag ":latest"
-          # local (tag này không được compose cập nhật vì deploy luôn pull theo SHA tag).
-          if docker inspect n8n-backend >/dev/null 2>&1; then
-            docker tag "$(docker inspect --format='{{.Image}}' n8n-backend)" backup-backend:latest
-          else
-            echo "No running backend container found, skipping backup."
+          mkdir -p "$APP_DIR"
+          cp docker-compose.prod.yml "$APP_DIR/"
+          cd "$APP_DIR"
+
+          if [ ! -f .env.production ]; then
+            echo "::error::Missing $APP_DIR/.env.production on server"
+            exit 1
           fi
-          if docker inspect n8n-frontend >/dev/null 2>&1; then
-            docker tag "$(docker inspect --format='{{.Image}}' n8n-frontend)" backup-frontend:latest
-          else
-            echo "No running frontend container found, skipping backup."
-          fi
 
-          echo "Deploying version: $IMAGE_TAG"
-          docker compose -f docker-compose.prod.yml --env-file .env.production up -d --pull always
+          export IMAGE_BACKEND="${DOCKER_NAMESPACE}/backend"
+          export IMAGE_FRONTEND="${DOCKER_NAMESPACE}/frontend"
+          export IMAGE_TAG
 
-          echo "Waiting for app to stabilize (30s)..."
-          sleep 30
-
-          # HÀM ROLLBACK ĐỂ DÙNG CHUNG
-          rollback() {
-            echo "❌ $1"
-            setup_env
-            if docker image inspect backup-backend:latest >/dev/null 2>&1 && docker image inspect backup-frontend:latest >/dev/null 2>&1; then
-              echo "Rolling back to previous version..."
-              docker compose -f docker-compose.prod.yml down
-              docker tag backup-backend:latest "$IMAGE_BACKEND:rollback"
-              docker tag backup-frontend:latest "$IMAGE_FRONTEND:rollback"
-              IMAGE_TAG=rollback docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+          echo "📦 Backup current version"
+          # Backup theo image ID của container ĐANG chạy, không dựa vào tag ":latest"
+          HAS_BACKUP=true
+          for svc in backend frontend; do
+            if docker inspect "n8n-$svc" >/dev/null 2>&1; then
+              docker tag "$(docker inspect --format='{{.Image}}' "n8n-$svc")" "backup-$svc:latest"
             else
-              echo "⚠️ No backup found (likely first deploy). Checking logs..."
-              docker compose -f docker-compose.prod.yml logs --tail=50
+              echo "No running $svc container found."
+              HAS_BACKUP=false
+            fi
+          done
+
+          rollback() {
+            trap - ERR
+            set +e
+            echo "::error::$1"
+            compose logs --tail=100
+            if [ "$HAS_BACKUP" != true ]; then
+              echo "::warning::No full backup found (likely first deploy). Cannot roll back."
+              exit 1
+            fi
+            echo "↩️ Rolling back to previous version..."
+            export IMAGE_BACKEND=backup-backend IMAGE_FRONTEND=backup-frontend IMAGE_TAG=latest
+            if compose up -d --pull never --wait --wait-timeout 120 && health_check; then
+              echo "::warning::Rolled back to previous version successfully."
+            else
+              echo "::error::ROLLBACK FAILED - manual intervention required!"
             fi
             exit 1
           }
+          # Bất kỳ lệnh nào fail từ đây (pull, compose up, healthcheck...) đều kích hoạt rollback
+          trap 'rollback "Deploy failed (line $LINENO)"' ERR
 
-          # 1. Kiểm tra API qua Nginx (Đây là đường dẫn quan trọng nhất)
-          echo "Checking API via Nginx (http://localhost:80/api/v1/health)..."
-          if ! curl -sSf http://localhost:80/api/v1/health > /dev/null; then
-            rollback "API Health Check via Nginx FAILED!"
-          fi
+          echo "🚀 Deploying version: $IMAGE_TAG"
+          # --wait: chờ đến khi các container báo healthy (theo healthcheck trong compose)
+          compose up -d --pull always --remove-orphans --wait --wait-timeout 180
 
-          # 2. Kiểm tra Frontend (Trang chủ)
-          echo "Checking Frontend UI (http://localhost:80)..."
-          if ! curl -sSf http://localhost:80 > /dev/null; then
-            rollback "Frontend UI FAILED!"
-          fi
+          health_check || rollback "Health check failed"
 
+          trap - ERR
           echo "✅ Deploy successful!"
 
+          # Dọn image cũ hơn 7 ngày (image đang được container dùng sẽ không bị xoá)
+          docker image prune -af --filter "until=168h" || true
+
+      - name: Logout from Docker Hub
+        if: always()
+        run: docker logout
+
   # =========================
-  # 4️⃣ NOTIFY
+  # 3️⃣ NOTIFY
   # =========================
   notify:
     name: Notify
-    runs-on: self-hosted
-    needs: deploy
-    # always() bỏ qua kết quả needs mặc định, nên phải tự loại trừ trường hợp deploy bị skip
-    # (ví dụ khi docker-build hoặc image-scan fail khiến deploy không chạy)
-    if: always() && needs.deploy.result != 'skipped'
-    timeout-minutes: 2
+    runs-on: ubuntu-24.04
+    needs: [ci, build-scan-push, deploy]
+    # Luôn gửi mail, kể cả khi CI / build / scan fail (deploy bị skip)
+    if: always()
+    timeout-minutes: 5
     steps:
       - name: Send Email
-        uses: dawidd6/action-send-mail@v3
+        uses: dawidd6/action-send-mail@v22
         with:
           server_address: smtp.gmail.com
           server_port: 465
+          secure: true
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "🚀 Deploy Status: ${{ needs.deploy.result }}"
+          subject: "${{ needs.deploy.result == 'success' && '✅' || '❌' }} Deploy ${{ github.repository }}: ${{ needs.deploy.result == 'success' && 'success' || 'failed' }}"
           to: ${{ secrets.NOTIFY_EMAIL }}
           from: GitHub Actions
-          secure: true
           body: |
-            Status: ${{ needs.deploy.result }}
+            Repository: ${{ github.repository }}
             Commit: ${{ github.sha }}
-            Link: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Author: ${{ github.actor }}
+
+            CI:                ${{ needs.ci.result }}
+            Build/Scan/Push:   ${{ needs.build-scan-push.result }}
+            Deploy:            ${{ needs.deploy.result }}
+
+            Link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
