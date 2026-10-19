@@ -211,12 +211,51 @@ jobs:
         run: docker logout
 
   # =========================
+  # 2️⃣.1 RUNNER WATCHDOG
+  # =========================
+  # GitHub không có timeout cho thời gian chờ runner (job "Queued" có thể treo tới 24h).
+  # Job này chạy song song với deploy: nếu sau 5 phút deploy vẫn chưa được self-hosted
+  # runner nhận thì huỷ cả run và báo fail.
+  runner-watchdog:
+    name: Wait for self-hosted runner (max 5m)
+    runs-on: ubuntu-24.04
+    needs: build-scan-push
+    timeout-minutes: 7
+    permissions:
+      actions: write # cần để đọc trạng thái job và huỷ run
+    steps:
+      - name: Check deploy job is picked up
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_JOB_NAME: Deploy with rollback
+          MAX_WAIT_SECONDS: 300
+        run: |
+          deadline=$(( $(date +%s) + MAX_WAIT_SECONDS ))
+          while :; do
+            status=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=100" \
+              --jq ".jobs[] | select(.name == \"${DEPLOY_JOB_NAME}\") | .status")
+            echo "Deploy job status: ${status:-<not created>}"
+
+            case "$status" in
+              # Đã có runner nhận, đã xong, hoặc đang chờ duyệt tay (environment reviewers) -> OK
+              in_progress|completed|waiting) exit 0 ;;
+            esac
+
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::No self-hosted runner picked up '${DEPLOY_JOB_NAME}' within $((MAX_WAIT_SECONDS / 60)) minutes. Check Settings → Actions → Runners (runner offline?). Cancelling run."
+              gh run cancel "${GITHUB_RUN_ID}" --repo "${GITHUB_REPOSITORY}"
+              exit 1
+            fi
+            sleep 10
+          done
+
+  # =========================
   # 3️⃣ NOTIFY
   # =========================
   notify:
     name: Notify
     runs-on: ubuntu-24.04
-    needs: [ci, build-scan-push, deploy]
+    needs: [ci, build-scan-push, deploy, runner-watchdog]
     # Luôn gửi mail, kể cả khi CI / build / scan fail (deploy bị skip)
     if: always()
     timeout-minutes: 5
@@ -240,5 +279,6 @@ jobs:
             CI:                ${{ needs.ci.result }}
             Build/Scan/Push:   ${{ needs.build-scan-push.result }}
             Deploy:            ${{ needs.deploy.result }}
+            Runner watchdog:   ${{ needs.runner-watchdog.result }}${{ needs.runner-watchdog.result == 'failure' && ' (self-hosted runner offline - không có runner nhận job trong 5 phút)' || '' }}
 
             Link: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
