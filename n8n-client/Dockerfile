@@ -10,7 +10,7 @@ RUN yarn build
 # --- Stage 2: Serve ---
 FROM nginx:stable-alpine
 
-RUN rm -rf /usr/share/nginx/html/*
+RUN apk upgrade --no-cache && rm -rf /usr/share/nginx/html/*
 
 COPY --from=build-stage /app/dist /usr/share/nginx/html
 
