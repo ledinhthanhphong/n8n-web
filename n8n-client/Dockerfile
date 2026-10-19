@@ -1,5 +1,5 @@
 # --- Stage 1: Build ---
-FROM node:24-alpine AS build-stage
+FROM node:26-alpine AS build-stage
 WORKDIR /app
 RUN corepack enable
 COPY package.json yarn.lock .yarnrc.yml ./
