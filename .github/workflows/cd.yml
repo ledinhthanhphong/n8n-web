@@ -48,7 +48,7 @@ jobs:
             context: ./n8n-client
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Create Production Env for Frontend
         if: matrix.name == 'frontend'
@@ -56,15 +56,15 @@ jobs:
           VITE_API_URL: ${{ vars.VITE_API_URL || secrets.VITE_API_URL }}
         run: echo "VITE_API_URL=${VITE_API_URL}" > ./n8n-client/.env.production
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build image (load locally, not pushed yet)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ${{ matrix.context }}
           push: false
@@ -78,7 +78,7 @@ jobs:
 
       # Cache Trivy vulnerability DB để tránh tải lại mỗi lần chạy (tránh bị rate-limit)
       - name: Cache Trivy DB
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/trivy
           key: trivy-db-${{ steps.date.outputs.today }}
@@ -115,10 +115,10 @@ jobs:
     environment: production
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
