@@ -1,17 +1,22 @@
 name: ✅ CI
 
 on:
-  push:
-    branches-ignore: ["main"]
   pull_request:
     branches: ["main"]
+  # Cho phép CD gọi lại CI trước khi build & deploy (chặn trường hợp push thẳng lên main)
+  workflow_call:
+
+permissions:
+  contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  # Chỉ huỷ run cũ với PR; khi được CD gọi thì không huỷ để tránh làm fail deploy
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TRIVY_VERSION: 0.75.0
 
 jobs:
   # =========================
@@ -20,29 +25,30 @@ jobs:
   backend-ci:
     name: Backend CI
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: n8n-server
     steps:
       - uses: actions/checkout@v4
+
+      # Phải bật corepack TRƯỚC setup-node để cache dùng đúng Yarn 4 theo packageManager
+      - name: Enable corepack
+        run: corepack enable
+        working-directory: .
 
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-
-      - name: Cache Yarn
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.yarn/cache
-            n8n-server/.yarn/cache
-          key: ${{ runner.os }}-backend-${{ hashFiles('n8n-server/yarn.lock') }}
+          cache: yarn
+          cache-dependency-path: n8n-server/yarn.lock
 
       - name: Install deps
-        run: |
-          corepack enable
-          cd n8n-server
-          yarn install --immutable
+        run: yarn install --immutable
 
-      - name: Validate backend entry syntax
-        run: cd n8n-server && node --check index.js
+      # Kiểm tra cú pháp TẤT CẢ file JS (không chỉ index.js)
+      - name: Syntax check all source files
+        run: git ls-files '*.js' '*.cjs' '*.mjs' | xargs -n1 node --check
 
   # =========================
   # 2️⃣ FRONTEND CI
@@ -50,38 +56,41 @@ jobs:
   frontend-ci:
     name: Frontend CI
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: n8n-client
     steps:
       - uses: actions/checkout@v4
+
+      - name: Enable corepack
+        run: corepack enable
+        working-directory: .
 
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-
-      - name: Cache Yarn
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.yarn/cache
-            n8n-client/.yarn/cache
-          key: ${{ runner.os }}-frontend-${{ hashFiles('n8n-client/yarn.lock') }}
+          cache: yarn
+          cache-dependency-path: n8n-client/yarn.lock
 
       - name: Install deps
-        run: |
-          corepack enable
-          cd n8n-client
-          yarn install --immutable
+        run: yarn install --immutable
 
-      - name: Lint (fast fail-fast check)
-        run: cd n8n-client && yarn lint
+      - name: Lint
+        run: yarn lint
 
   # =========================
-  # 3️⃣ DOCKER BUILD CHECK (no push)
+  # 3️⃣ DOCKER BUILD + SECURITY SCAN (no push)
   # =========================
+  # Chỉ chạy cho PR. Khi CD gọi CI thì CD đã tự build & scan, không cần build 2 lần.
   docker-build-check:
-    name: Docker Build Check
+    name: Docker Build & Scan (${{ matrix.name }})
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     needs: [backend-ci, frontend-ci]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: backend
@@ -94,16 +103,41 @@ jobs:
 
       - name: Create Production Env for Frontend
         if: matrix.name == 'frontend'
-        run: echo "VITE_API_URL=${{ secrets.VITE_API_URL }}" > ./n8n-client/.env.production
+        env:
+          VITE_API_URL: ${{ vars.VITE_API_URL || secrets.VITE_API_URL }}
+        run: echo "VITE_API_URL=${VITE_API_URL}" > ./n8n-client/.env.production
 
       - uses: docker/setup-buildx-action@v3
 
-      # Chỉ build để bắt lỗi Dockerfile/dependency sớm, KHÔNG push image lên registry
-      # (việc build & push thật sự chỉ diễn ra ở CD sau khi merge vào main)
-      - name: Build image (validate only)
+      - name: Build image (validate only, no push)
         uses: docker/build-push-action@v6
         with:
           context: ${{ matrix.context }}
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          load: true
+          tags: ci-${{ matrix.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - id: date
+        run: echo "today=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ steps.date.outputs.today }}
+          restore-keys: trivy-db-
+
+      # Shift-left: phát hiện lỗ hổng ngay ở PR thay vì đợi merge vào main
+      - name: Trivy scan
+        run: |
+          mkdir -p ~/.cache/trivy
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+            "aquasec/trivy:${TRIVY_VERSION}" image \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --exit-code 1 \
+            "ci-${{ matrix.name }}:${{ github.sha }}"

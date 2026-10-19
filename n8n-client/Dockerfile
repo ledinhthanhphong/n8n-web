@@ -1,8 +1,9 @@
 # --- Stage 1: Build ---
 FROM node:24-alpine AS build-stage
 WORKDIR /app
-COPY package.json yarn.lock ./
-RUN corepack enable && yarn install
+RUN corepack enable
+COPY package.json yarn.lock .yarnrc.yml ./
+RUN yarn install --immutable
 COPY . .
 RUN yarn build
 

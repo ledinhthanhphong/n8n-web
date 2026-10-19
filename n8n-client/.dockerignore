@@ -1,0 +1,31 @@
+# Dependency directories
+node_modules
+.yarn/cache
+.yarn/unplugged
+.yarn/install-state.gz
+
+# Debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env cho local dev (.env.production được CI tạo lúc build nên KHÔNG ignore)
+.env
+.env.development
+.env.local
+
+# Git / Docker
+.git
+.gitignore
+Dockerfile
+.dockerignore
+
+# Build output
+dist
+build
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode
+.idea

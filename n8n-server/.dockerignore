@@ -41,3 +41,5 @@ coverage
 # Editor folders
 .vscode
 .idea
+# Logs
+logs

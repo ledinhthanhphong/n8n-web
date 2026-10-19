@@ -1,0 +1,15 @@
+# Tự động mở PR khi GitHub Actions / base image Docker có bản mới
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directories: ["/n8n-server", "/n8n-client"]
+    schedule:
+      interval: weekly
