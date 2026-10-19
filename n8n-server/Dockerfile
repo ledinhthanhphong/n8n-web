@@ -1,5 +1,5 @@
 # Stage 1: Install production dependencies
-FROM node:24-bookworm-slim AS builder
+FROM node:26-bookworm-slim AS builder
 WORKDIR /app
 RUN corepack enable
 COPY package.json yarn.lock .yarnrc.yml ./
@@ -7,7 +7,7 @@ RUN yarn workspaces focus --all --production
 COPY . .
 
 # Stage 2: Runtime
-FROM node:24-bookworm-slim
+FROM node:26-bookworm-slim
 WORKDIR /app
 
 ENV NODE_ENV=production
